@@ -1,120 +1,133 @@
 #!/usr/bin/env python3
 """
-aurora_train_pr.py
+aurora_model_v2.py
 ------------------
-• 讀 processed/dataset_station_daily.csv
-• 2015 -> train, 2016 -> valid
-• XGBoost  + PR curve
-• 找 Precision ≥ TARGET_P 的最小 threshold
-• 儲存模型 & 圖
+• 讀 data/processed/dataset_station_daily.csv
+• rule-based filter：夜間 & geomag_lat≥57 & kp_max≥4
+• 新增時間週期特徵
+• LightGBM 訓練 (2015→train, 2016→valid)
+• 畫 PR curve & 自動找 Precision≥TARGET_P threshold
+• 保存模型 + threshold + PR PNG
 """
 
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from xgboost import XGBClassifier
-from sklearn.metrics import (
-    precision_recall_curve,
-    average_precision_score,
-    precision_score,
-    recall_score,
-)
+import lightgbm as lgb
+from sklearn.metrics import precision_recall_curve, average_precision_score
+from sklearn.metrics import precision_score, recall_score
 import matplotlib.pyplot as plt
 import joblib
-from tqdm import tqdm
+from datetime import timezone, timedelta
 
-# ----- 參數 -----
-DATA_PATH  = Path("data/processed/dataset.csv")
-MODEL_DIR  = Path("models")
-FIG_DIR    = Path("figures")
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
-FIG_DIR.mkdir(parents=True, exist_ok=True)
+# ── 參數 ─────────────────────────────────────────
+DATA   = Path("data/processed/dataset.csv")
+MODEL  = Path("models/lgbm_aurora.pkl")
+PR_PNG = Path("figures/pr_curve_v2.png")
+THR_TXT= Path("models/best_threshold.txt")
+TARGET_P = 0.90       # 目標 Precision
+# ────────────────────────────────────────────────
 
-TARGET_P   = 0.90            # 目標 Precision 下限
-RANDOM_SEED = 42
-
-FEATURES = [
+FEATURES_BASE = [
     "kp_max","kp_mean","Ap","F107",
     "temp","visib","prcp","wdsp",
     "LAT","LON","ELEV(M)"
 ]
-# ----------------
 
-def load_split():
-    df = pd.read_csv(DATA_PATH, parse_dates=["date"])
-    df.sort_values("date", inplace=True)
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
+    # local hour (粗略：經度/15 + UTC hour)
+    utc_hour = df["date"].dt.hour
+    local_hour = (utc_hour + (df["LON"] / 15.0)).mod(24)
+    df["local_hour"] = local_hour
 
-    train = df[df["date"].dt.year == 2015]
-    valid = df[df["date"].dt.year == 2016]
+    # night flag（18–6）
+    df["is_night"] = ((local_hour >= 18) | (local_hour <= 6)).astype(int)
 
-    X_tr, y_tr = train[FEATURES], train["see_aurora"]
-    X_va, y_va = valid[FEATURES], valid["see_aurora"]
-    return X_tr, y_tr, X_va, y_va
+    # day of year 週期
+    doy = df["date"].dt.dayofyear
+    df["sin_doy"] = np.sin(2*np.pi*doy/365.25)
+    df["cos_doy"] = np.cos(2*np.pi*doy/365.25)
 
-def train_xgb(X_tr, y_tr):
-    pos_w = (len(y_tr) - y_tr.sum()) / y_tr.sum()
-    clf = XGBClassifier(
-        n_estimators=600,
-        max_depth=6,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        scale_pos_weight=pos_w,
-        objective="binary:logistic",
-        eval_metric="aucpr",
-        n_jobs=-1,
-        random_state=RANDOM_SEED,
-        verbosity=0,
+    # kp ratio
+    df["kp_ratio"] = df["kp_max"] / (df["kp_mean"] + 1e-6)
+    return df
+
+def rule_filter(df: pd.DataFrame) -> pd.DataFrame:
+    cond = (
+        (df["is_night"] == 1) &
+        (df["LAT"] >= 57) &              # 用幾何緯度近似磁緯
+        (df["kp_max"] >= 4)
     )
-    clf.fit(X_tr, y_tr)
-    return clf
+    return df[cond].reset_index(drop=True)
 
 def choose_threshold(y_true, y_prob, target_p):
-    prec, rec, thr = precision_recall_curve(y_true, y_prob)
-    # precision_recall_curve 不返回最後一個 threshold，因此加一個 1.0
-    thr = np.append(thr, 1.0)
-    mask = prec >= target_p
-    if not mask.any():
-        # 若達不到目標 precision，取 precision 最大點
-        idx = np.argmax(prec)
-    else:
-        idx = np.where(mask)[0][0]     # 第一個達標的最小 threshold
-    return thr[idx], prec[idx], rec[idx], prec, rec, thr
+    p, r, t = precision_recall_curve(y_true, y_prob)
+    t = np.append(t, 1.0)
+    mask = p >= target_p
+    idx = np.where(mask)[0][0] if mask.any() else np.argmax(p)
+    return t[idx], p[idx], r[idx], p, r
 
-def plot_pr(prec, rec, target_p, out_path):
+def plot_pr(p, r):
     plt.figure()
-    plt.plot(rec, prec)
-    plt.axhline(target_p, ls="--")
-    plt.xlabel("Recall")
-    plt.ylabel("Precision")
-    plt.title(f"PR curve (target P≥{target_p})")
-    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.plot(r, p)
+    plt.axhline(TARGET_P, ls="--", c="red")
+    plt.xlabel("Recall"); plt.ylabel("Precision")
+    plt.title(f"PR curve (target ≥{TARGET_P})")
+    PR_PNG.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(PR_PNG, dpi=300, bbox_inches="tight")
     plt.close()
 
 def main():
-    print("📥 Loading & splitting …")
-    X_tr, y_tr, X_va, y_va = load_split()
+    # ── 讀取 & 基本處理 ──────────────────
+    df = pd.read_csv(DATA, parse_dates=["date"])
+    df = add_features(df)
+    df = rule_filter(df)                 # ⬅ rule-based 提升 Precision
 
-    print("🚂 Training XGBoost …")
-    model = train_xgb(X_tr, y_tr)
+    # ── 切 train / valid ────────────────
+    train = df[df["date"].dt.year == 2015]
+    valid = df[df["date"].dt.year == 2016]
 
-    print("🔎 Evaluating on 2016 …")
-    y_prob = model.predict_proba(X_va)[:,1]
-    thr, p_at_thr, r_at_thr, prec, rec, thr_all = choose_threshold(y_va, y_prob, TARGET_P)
+    X_train = train[FEATURES_BASE + ["local_hour","is_night","sin_doy","cos_doy","kp_ratio"]]
+    y_train = train["see_aurora"]
+    X_valid = valid[X_train.columns]
+    y_valid = valid["see_aurora"]
 
-    pr_auc = average_precision_score(y_va, y_prob)
+    # ── LightGBM 訓練 ────────────────────
+    scale_pos_weight = (len(y_train) - y_train.sum()) / y_train.sum()
+    model = lgb.LGBMClassifier(
+        n_estimators=800,
+        learning_rate=0.03,
+        max_depth=-1,
+        num_leaves=64,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        objective="binary",
+        class_weight={0:1, 1:scale_pos_weight},
+        n_jobs=-1,
+        random_state=42,
+    )
+    model.fit(X_train, y_train)
 
-    print(f"\nSelected threshold = {thr:.3f}")
-    print(f"Precision = {p_at_thr:.3f} | Recall = {r_at_thr:.3f} | PR-AUC = {pr_auc:.3f}")
+    # ── PR curve & threshold ─────────────
+    y_prob = model.predict_proba(X_valid)[:,1]
+    thr, P, R, prec, rec = choose_threshold(y_valid, y_prob, TARGET_P)
 
-    # 圖 & 模型輸出
-    fig_path   = FIG_DIR / "pr_curve.png"
-    model_path = MODEL_DIR / "xgb_aurora.pkl"
-    plot_pr(prec, rec, TARGET_P, fig_path)
-    joblib.dump({"model": model, "threshold": thr, "features": FEATURES}, model_path)
+    pr_auc = average_precision_score(y_valid, y_prob)
+    print(f"\nChosen threshold = {thr:.3f}")
+    print(f"Precision = {P:.3f} | Recall = {R:.3f} | PR-AUC = {pr_auc:.3f}")
 
-    print(f"\n✅ Saved PR curve  → {fig_path}")
-    print(f"✅ Saved model     → {model_path}")
+    plot_pr(prec, rec)
+
+    # ── 保存模型 & threshold ─────────────
+    MODEL.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump({"model":model, "threshold":thr, "features":X_train.columns.tolist()}, MODEL)
+
+    with open(THR_TXT, "w") as f:
+        f.write(f"threshold={thr:.5f}\nprecision={P:.5f}\nrecall={R:.5f}\npr_auc={pr_auc:.5f}\n")
+
+    print(f"\n✅ model → {MODEL}")
+    print(f"✅ PR curve → {PR_PNG}")
+    print(f"✅ threshold txt → {THR_TXT}")
 
 if __name__ == "__main__":
     main()
