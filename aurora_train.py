@@ -1,141 +1,107 @@
-# aurora_train.py  (All‑in‑one, patched)
-# -------------------------------------------------------------
-# 小資料極光預測流程
-# 1. 讀 dataset_station_daily.csv（你已整理好的每日站點特徵）
-# 2. 特徵工程 + 物理先驗 (prob_phy)
-# 3. Positive‑Unlabeled：
-#    • Positive  = see_aurora == 1
-#    • Negative* = 夜間 & kp_max<=2 & visib<=2 (高可信 0)
-# 4. LightGBM 訓練 (2015 train / 2016 valid)
-#    • choose_threshold：取驗證機率 95‑th percentile，且下限 0.5
-# 5. 產生 2025‑06‑15 ➜ 2026‑06‑14 每日預測
-#    • 缺值以低值 + 訓練中位數補
-#    • Hard gate：夜間 & kp_max≥4 & LAT≥55 才進模型，其餘 prob=0
-# 6. 輸出
-#    • 模型  → output/lgbm_aurora_v2.pkl
-#    • 圖    → output/pr_curve_v2.png
-#    • 預測  → output/predictions_20250615_20260614.csv
-# -------------------------------------------------------------
+#!/usr/bin/env python3
+# aurora_train.py  ― 2024-06-15 ➜ 2025-06-14 & country lookup
+# ----------------------------------------------------------
 
 from pathlib import Path
-import numpy as np
 import pandas as pd
+import numpy as np
 import lightgbm as lgb
 from sklearn.metrics import precision_recall_curve, average_precision_score
-import joblib
-import matplotlib.pyplot as plt
+import joblib, matplotlib.pyplot as plt
+from datetime import datetime, timedelta
 
-# ---------------- 路徑 ----------------
+# ---------- 路徑 ----------
 DATA = Path("data/processed/dataset.csv")
-OUT  = Path("output"); OUT.mkdir(parents=True, exist_ok=True)
-MODEL_PATH = OUT / "lgbm_aurora_v2.pkl"
-PRED_PATH  = OUT / "predictions_20250615_20260614.csv"
-FIG_PATH   = OUT / "pr_curve_v2.png"
+ISD  = Path("data/raw/isd-history.csv")
+OUT_DIR = Path("output")
+OUT_DIR.mkdir(exist_ok=True, parents=True)
+# -------------------------
 
-TARGET_PREC = 0.90
+TARGET_P = .90         # Precision 下限
+SEED     = 42
 
-BASE_FEATURES = [
-    "kp_max", "kp_mean", "Ap", "F107",   # 太陽/地磁
-    "temp", "visib", "prcp", "wdsp",      # 天氣
-    "LAT", "LON", "ELEV(M)"                # 地理
+# ----------------- 讀原始資料 -----------------
+df = pd.read_csv(DATA, parse_dates=["date"])
+# ----------- 站點對應 country ---------------
+isd = pd.read_csv(ISD, dtype=str, low_memory=False)
+isd["station_id"] = isd["USAF"].str.zfill(6) + isd["WBAN"].str.zfill(5)
+station2ctry = isd.set_index("station_id")["CTRY"].to_dict()
+df["station_id"] = df["station_id"].astype(str).str.zfill(11)
+df["country"] = df["station_id"].map(station2ctry).fillna("NA")
+
+# ------------- 基本特徵（示例，同原有） -------------
+feat_cols = [
+    "kp_max","kp_mean","Ap","F107",
+    "temp","visib","prcp","wdsp",
+    "LAT","LON","ELEV(M)"
 ]
+# ----------- train / valid 切分 ---------------
+train = df[df["date"].dt.year==2015]
+valid = df[df["date"].dt.year==2016]
 
-# -------------- Feature 工具 --------------
+X_tr, y_tr = train[feat_cols], train["see_aurora"]
+X_va, y_va = valid[feat_cols], valid["see_aurora"]
 
-def add_features(df: pd.DataFrame) -> pd.DataFrame:
-    utc_hour = df["date"].dt.hour
-    local_hour = (utc_hour + (df["LON"] / 15.0)).mod(24)
-    df["local_hour"] = local_hour
-    df["is_night"]   = ((local_hour >= 18) | (local_hour <= 6)).astype(int)
+# ----------- LightGBM 訓練 --------------------
+scale_pos = (len(y_tr)-y_tr.sum()) / y_tr.sum()
+model = lgb.LGBMClassifier(
+    n_estimators=800,
+    learning_rate=0.03,
+    num_leaves=64,
+    max_depth=-1,
+    subsample=.8,
+    colsample_bytree=.8,
+    class_weight={0:1, 1:scale_pos},
+    random_state=SEED,
+    verbose=-1,
+)
+model.fit(X_tr, y_tr)
 
-    doy = df["date"].dt.dayofyear
-    df["sin_doy"] = np.sin(2*np.pi*doy/365.25)
-    df["cos_doy"] = np.cos(2*np.pi*doy/365.25)
+# ----------- PR curve & threshold ------------
+prob_va = model.predict_proba(X_va)[:,1]
+prec, rec, thr = precision_recall_curve(y_va, prob_va)
+thr = np.append(thr, 1.0)
+# 找第一個 precision ≥ TARGET_P 的 threshold，若無則取 0.5
+mask = prec >= TARGET_P
+best_thr = thr[np.where(mask)[0][0]] if mask.any() else 0.5
 
-    df["kp_ratio"] = df["kp_max"] / (df["kp_mean"] + 1e-6)
-    return df
+print(f"Threshold = {best_thr:.3f}  (Precision target {TARGET_P})")
+print(f"Valid  Precision={prec[mask][0] if mask.any() else prec.max():.3f}")
 
-# choose threshold by percentile
+# ----------- 未來一年資料框 -------------------
+start = datetime(2024,6,15)
+end   = datetime(2025,6,14)
+days  = (end - start).days + 1
+future_dates = [start + timedelta(d) for d in range(days)]
 
-def choose_threshold_by_pct(y_prob: np.ndarray, pct: float = 95, floor: float = 0.5):
-    thr = np.percentile(y_prob, pct)
-    return max(thr, floor)
+# 用 2024-06-14 最近一次的站點靜態資訊複製
+latest = df.groupby("station_id").last().reset_index()
+rows=[]
+for d in future_dates:
+    tmp = latest.copy()
+    tmp["date"] = d
+    rows.append(tmp)
+future = pd.concat(rows, ignore_index=True)
 
-# -------------- 主流程 --------------
+# 填缺值：數值 -> 訓練中位數；類別 -> "NA"
+future[feat_cols] = future[feat_cols].fillna(X_tr.median())
+future["country"] = future["country"].fillna("NA")
 
-def main():
-    # 1. 讀資料
-    df = pd.read_csv(DATA, parse_dates=["date"], low_memory=False)
-    df = add_features(df)
+# ---------- 推論 + predict -------------------
+future["prob_model"] = model.predict_proba(future[feat_cols])[:,1]
+future["predict"] = (future["prob_model"] >= best_thr).astype(int)
 
-    # 物理先驗：sigmoid(kp_max)
-    df["prob_phy"] = 1/(1+np.exp(-1.2*(df["kp_max"]-4)))
+# ------------ 輸出 CSV -----------------------
+out_csv = OUT_DIR / "predictions_20240615_20250614.csv"
+cols_out = ["date","station_id","country","LAT","LON",
+            "prob_model","predict"]
+future[cols_out].to_csv(out_csv, index=False)
+print("✅  saved to", out_csv)
 
-    # 2. PU 樣本
-    pos_df = df[df["see_aurora"] == 1]
-    neg_df = df[(df["is_night"]==1) & (df["kp_max"]<=2) & (df["visib"]<=2)]
-    train_df = pd.concat([pos_df, neg_df], ignore_index=True).sort_values("date")
+# ------------ 保存模型 & PR 圖 ---------------
+joblib.dump({"model":model,"thr":best_thr,"features":feat_cols}, OUT_DIR/"lgbm_aurora.pkl")
 
-    # Train / valid split
-    train = train_df[train_df["date"].dt.year == 2015]
-    valid = train_df[train_df["date"].dt.year == 2016]
-
-    feat_cols = BASE_FEATURES + ["local_hour","is_night","sin_doy","cos_doy","kp_ratio","prob_phy"]
-    X_train, y_train = train[feat_cols], train["see_aurora"].fillna(0).astype(int)
-    X_valid, y_valid = valid[feat_cols], valid["see_aurora"].fillna(0).astype(int)
-
-    # 3. LightGBM
-    scale_pos_weight = (len(y_train)-y_train.sum())/y_train.sum()
-    model = lgb.LGBMClassifier(
-        n_estimators=800,
-        learning_rate=0.03,
-        num_leaves=128,
-        min_child_samples=8,
-        min_gain_to_split=1e-3,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        objective="binary",
-        class_weight={0:1,1:scale_pos_weight},
-        random_state=42,
-        n_jobs=-1,
-    )
-    model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], callbacks=[lgb.log_evaluation(period=0)])
-
-    y_prob_val = model.predict_proba(X_valid)[:,1]
-    thr = choose_threshold_by_pct(y_prob_val, pct=95, floor=0.5)
-    P = ((y_prob_val>=thr) & (y_valid==1)).sum() / max((y_prob_val>=thr).sum(),1)
-    R = ((y_prob_val>=thr) & (y_valid==1)).sum() / y_valid.sum()
-    pr_auc = average_precision_score(y_valid, y_prob_val)
-
-    print(f"Validation  P={P:.3f} R={R:.3f} PR_AUC={pr_auc:.3f} thr={thr:.3f}")
-
-    # PR curve
-    prec, rec, _ = precision_recall_curve(y_valid, y_prob_val)
-    plt.figure(); plt.plot(rec, prec); plt.axhline(TARGET_PREC, ls="--", c="r")
-    plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title("PR curve v2")
-    plt.savefig(FIG_PATH, dpi=300, bbox_inches="tight"); plt.close()
-
-    # 保存模型
-    joblib.dump({"model":model, "threshold":thr, "features":feat_cols}, MODEL_PATH)
-
-    # 4. 未來一年推論
-    last_rows = df.sort_values("date").groupby("station_id").tail(1).copy()
-    future_dates = pd.date_range("2025-06-15", "2026-06-14", freq="D")
-    fut = pd.concat([last_rows.assign(date=d) for d in future_dates], ignore_index=True)
-    fut = add_features(fut)
-
-    # 缺值補：物理低值 + 中位
-    low_fill = {"kp_max":0, "kp_mean":0, "Ap":0, "F107":X_train["F107"].min()}
-    fut[feat_cols] = fut[feat_cols].fillna(low_fill).fillna(X_train.median())
-
-    # Hard gate
-    gate = ( (fut["is_night"]==1) & (fut["kp_max"]>=4) & (fut["LAT"]>=55) )
-    fut["prob_model"] = 0.0
-    fut.loc[gate, "prob_model"] = model.predict_proba(fut.loc[gate, feat_cols])[:,1]
-    fut["predict"] = (fut["prob_model"] >= thr).astype(int)
-
-    fut[["date","station_id","LAT","LON","prob_model","predict"]].to_csv(PRED_PATH, index=False)
-    print("輸出:\n  模型 →", MODEL_PATH, "\n  圖   →", FIG_PATH, "\n  預測 →", PRED_PATH)
-
-if __name__ == "__main__":
-    main()
+plt.figure()
+plt.plot(rec, prec); plt.axhline(TARGET_P, ls="--", c="r")
+plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title("PR curve v2")
+plt.savefig(OUT_DIR/"pr_curve_v2.png", dpi=250, bbox_inches="tight"); plt.close()
